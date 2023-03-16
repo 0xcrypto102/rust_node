@@ -7,17 +7,27 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use carbonado::{constants::Format, fs::Header, structs::Encoded};
+use carbonado::{
+    constants::{Format, FEC_M},
+    fs::Header,
+    structs::Encoded,
+};
 use log::{debug, trace};
 use rayon::prelude::*;
-use secp256k1::ecdh::SharedSecret;
+use secp256k1::{ecdh::SharedSecret, PublicKey, SecretKey};
 
 use crate::{config::SYS_CFG, prelude::*};
 
-pub async fn write_file(pk: Secp256k1PubKey, file_bytes: &[u8]) -> Result<Blake3Hash> {
+pub async fn write_file(pk: &Secp256k1PubKey, file_bytes: &[u8]) -> Result<Blake3Hash> {
     debug!("Write file, len: {}", file_bytes.len());
-    let pk_bytes = pk.to_bytes();
-    let (x_only_pk, _) = pk.into_inner().x_only_public_key();
+
+    trace!("Create a shared secret using ECDH");
+    let sk = SYS_CFG.private_key;
+    let ss = SharedSecret::new(&pk.into_inner(), &sk);
+    let write_pk = PublicKey::from_secret_key_global(&SecretKey::from_slice(&ss.secret_bytes())?);
+
+    let pk_bytes = write_pk.serialize();
+    let (x_only_pk, _) = write_pk.x_only_public_key();
 
     let file_hash = Blake3Hash(blake3::keyed_hash(&x_only_pk.serialize(), file_bytes));
 
@@ -37,13 +47,9 @@ pub async fn write_file(pk: Secp256k1PubKey, file_bytes: &[u8]) -> Result<Blake3
     encoded_segments.push(last_segment);
 
     trace!("Get eight storage volumes from config");
-    if SYS_CFG.volumes.len() != 8 {
+    if SYS_CFG.volumes.len() != FEC_M {
         return Err(anyhow!("Eight volume paths must be configured"));
     }
-
-    trace!("Create a shared secret using ECDH");
-    let sk = SYS_CFG.private_key;
-    let ss = SharedSecret::new(&pk.into_inner(), &sk);
 
     trace!("Split each segment out into 8 separate chunks and write each chunk to the storage volume by filename");
     let segment_hashes = encoded_segments
@@ -52,11 +58,11 @@ pub async fn write_file(pk: Secp256k1PubKey, file_bytes: &[u8]) -> Result<Blake3
             let Encoded(encoded_bytes, bao_hash, encode_info) = encoded_segment;
             trace!("Encoded bytes len: {}", encoded_bytes.len());
 
-            let encoded_chunk_size = encode_info.bytes_verifiable / 8;
+            let encoded_chunk_size = encode_info.bytes_verifiable as usize / FEC_M;
             trace!("Encoded chunk size: {}", encoded_chunk_size);
 
             encoded_bytes
-                .par_chunks_exact(encoded_chunk_size as usize)
+                .par_chunks_exact(encoded_chunk_size)
                 .enumerate()
                 .map(|(chunk_index, encoded_segment_chunk)| {
                     let volume = SYS_CFG
@@ -157,23 +163,28 @@ pub fn write_catalog(file_hash: &Blake3Hash, segment_hashes: &[BaoHash]) -> Resu
     Ok(())
 }
 
-pub async fn read_file(blake3_hash: &Blake3Hash) -> Result<Vec<u8>> {
+pub async fn read_file(pk: &Secp256k1PubKey, blake3_hash: &Blake3Hash) -> Result<Vec<u8>> {
     debug!("Read file by hash: {}", blake3_hash.to_string());
 
     trace!("Read catalog file bytes, parse out each hash, plus the segment Carbonado format");
     let catalog_file = read_catalog(blake3_hash)?;
 
     trace!("Get eight storage volumes from config");
-    if SYS_CFG.volumes.len() != 8 {
+    if SYS_CFG.volumes.len() != FEC_M {
         return Err(anyhow!("Eight volume paths must be configured"));
     }
+
+    trace!("Create a shared secret using ECDH");
+    let sk = SYS_CFG.private_key;
+    let ss = SharedSecret::new(&pk.into_inner(), &sk);
+    let ss_bytes = ss.secret_bytes();
 
     trace!("For each hash, read each chunk into a segment, then decode that segment");
     trace!("Segment files");
     let file_bytes = catalog_file
         .par_iter()
         .flat_map(|segment_hash| {
-            let path = SYS_CFG
+            let chunk_path = SYS_CFG
                 .volumes
                 .get(0)
                 .expect("Get first volume")
@@ -181,13 +192,8 @@ pub async fn read_file(blake3_hash: &Blake3Hash) -> Result<Vec<u8>> {
                 .join(SEGMENT_DIR)
                 .join(format!("{}.c{}", segment_hash, NODE_FORMAT));
 
-            trace!("Open segment at {}", path.to_string_lossy());
-            let file = OpenOptions::new().read(true).open(path).unwrap();
-            let header = Header::try_from(file).unwrap();
-
-            trace!("Create a shared secret using ECDH");
-            let sk = SYS_CFG.private_key;
-            let ss = SharedSecret::new(&header.pubkey, &sk);
+            let chunk_file = OpenOptions::new().read(true).open(chunk_path).unwrap();
+            let header = Header::try_from(chunk_file).unwrap();
 
             let segment = SYS_CFG
                 .volumes
@@ -210,7 +216,7 @@ pub async fn read_file(blake3_hash: &Blake3Hash) -> Result<Vec<u8>> {
                 .collect::<Vec<u8>>();
 
             carbonado::decode(
-                &ss.secret_bytes(),
+                &ss_bytes,
                 &segment_hash.to_bytes(),
                 &segment,
                 header.padding_len,
